@@ -24,9 +24,19 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
+# Headers más "de navegador real" — reduce (no elimina) la chance de bloqueo
+# por firewalls anti-bot como DataDome, que Lider y varios retailers chilenos usan.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+    "Referer": "https://www.lider.cl/",
+}
+
+HEADERS_CENCOSUD = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
 }
 
 
@@ -72,15 +82,12 @@ async def analizar_plato(file: UploadFile = File(...)):
         return {"error": "No se pudo analizar la imagen", "detalle": str(e)}
 
 
-# --- BÚSQUEDA DE PRECIOS: SIN FALLBACKS FIJOS ---
-# Cada función de búsqueda devuelve None si no encuentra el producto o si la
-# petición falla, en lugar de un precio inventado. Así el filtrado posterior
-# puede descartar limpiamente lo que no sea un resultado real.
+# --- BÚSQUEDA DE PRECIOS ---
 
 async def buscar_en_lider(cliente: httpx.AsyncClient, producto: str):
     try:
         url = f"https://apps.lider.cl/bff/search?query={producto}&page=1&facets="
-        res = await cliente.get(url, headers=HEADERS, timeout=6.0)
+        res = await cliente.get(url, headers=HEADERS, timeout=8.0)
         if res.status_code == 200:
             datos = res.json()
             productos = datos.get("products") or []
@@ -103,7 +110,7 @@ async def buscar_en_cencosud(cliente: httpx.AsyncClient, producto: str, marca: s
     try:
         dominio = "jumbo.cl" if marca == "Jumbo" else "santaisabel.cl"
         url = f"https://www.{dominio}/api/catalog_system/pub/products/search/{producto}"
-        res = await cliente.get(url, headers=HEADERS, timeout=6.0)
+        res = await cliente.get(url, headers=HEADERS_CENCOSUD, timeout=8.0)
         if res.status_code == 200:
             datos = res.json()
             if isinstance(datos, list) and len(datos) > 0:
@@ -131,7 +138,6 @@ async def obtener_precios(producto: str):
     if not busqueda_limpia:
         return {"busqueda": busqueda_limpia, "origen": "sin_busqueda", "resultados": []}
 
-    # 1. Intentar leer desde la caché de Supabase (sólo si hay filas reales cacheadas)
     if supabase:
         try:
             cache = supabase.table("precios_cache").select("*").eq("busqueda", busqueda_limpia).execute()
@@ -151,7 +157,6 @@ async def obtener_precios(producto: str):
         except Exception as e:
             print(f"Error consultando caché Supabase: {e}")
 
-    # 2. Si no está en caché, buscar en tiempo real en las 3 tiendas en paralelo
     async with httpx.AsyncClient() as cliente:
         tareas = [
             buscar_en_lider(cliente, busqueda_limpia),
@@ -160,10 +165,8 @@ async def obtener_precios(producto: str):
         ]
         resultados_crudos = await asyncio.gather(*tareas)
 
-    # 3. Descartar cualquier búsqueda que haya fallado o no encontrado nada real
     resultados = [r for r in resultados_crudos if r is not None]
 
-    # 4. Guardar en Supabase sólo si hay resultados reales (nunca precios inventados)
     if supabase and resultados:
         try:
             para_insertar = [
@@ -179,9 +182,61 @@ async def obtener_precios(producto: str):
         except Exception as e:
             print(f"Error guardando en caché Supabase: {e}")
 
-    # 5. Si no se encontró nada real, se devuelve un arreglo vacío con código 200
     return {
         "busqueda": busqueda_limpia,
         "origen": "en_vivo" if resultados else "sin_resultados",
         "resultados": resultados,
     }
+
+
+# --- ENDPOINT DE DIAGNÓSTICO (TEMPORAL) ---
+# Llama a esto desde el navegador o Postman:
+#   https://TU-BACKEND.onrender.com/api/debug-precios?producto=leche
+# Te muestra el status HTTP real y los primeros 500 caracteres de la
+# respuesta cruda de cada tienda, sin filtrar nada. Con esto vemos si:
+#   - status 403 / 429 -> te están bloqueando por IP (muy probable en Render)
+#   - status 200 pero body vacío o distinto -> cambió la estructura del endpoint
+#   - timeout / excepción -> el dominio no responde desde el servidor de Render
+@app.get("/api/debug-precios")
+async def debug_precios(producto: str):
+    busqueda_limpia = producto.lower().strip()
+    resultado_diagnostico = {}
+
+    async with httpx.AsyncClient() as cliente:
+        # Lider
+        try:
+            url_lider = f"https://apps.lider.cl/bff/search?query={busqueda_limpia}&page=1&facets="
+            res = await cliente.get(url_lider, headers=HEADERS, timeout=10.0)
+            resultado_diagnostico["lider"] = {
+                "status_code": res.status_code,
+                "url": url_lider,
+                "cuerpo_crudo": res.text[:500],
+            }
+        except Exception as e:
+            resultado_diagnostico["lider"] = {"error": str(e)}
+
+        # Jumbo
+        try:
+            url_jumbo = f"https://www.jumbo.cl/api/catalog_system/pub/products/search/{busqueda_limpia}"
+            res = await cliente.get(url_jumbo, headers=HEADERS_CENCOSUD, timeout=10.0)
+            resultado_diagnostico["jumbo"] = {
+                "status_code": res.status_code,
+                "url": url_jumbo,
+                "cuerpo_crudo": res.text[:500],
+            }
+        except Exception as e:
+            resultado_diagnostico["jumbo"] = {"error": str(e)}
+
+        # Santa Isabel
+        try:
+            url_si = f"https://www.santaisabel.cl/api/catalog_system/pub/products/search/{busqueda_limpia}"
+            res = await cliente.get(url_si, headers=HEADERS_CENCOSUD, timeout=10.0)
+            resultado_diagnostico["santa_isabel"] = {
+                "status_code": res.status_code,
+                "url": url_si,
+                "cuerpo_crudo": res.text[:500],
+            }
+        except Exception as e:
+            resultado_diagnostico["santa_isabel"] = {"error": str(e)}
+
+    return resultado_diagnostico

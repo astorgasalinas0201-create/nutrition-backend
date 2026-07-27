@@ -29,9 +29,11 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+
 @app.get("/")
 def inicio():
     return {"estado": "Servidor activo en Render 24/7 con Supabase 🔥"}
+
 
 # --- RUTA DE IA: ANÁLISIS DE FOTOS CON GEMINI ---
 @app.post("/api/analizar-plato")
@@ -39,18 +41,18 @@ async def analizar_plato(file: UploadFile = File(...)):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY no configurada")
-    
+
     try:
         contenido_imagen = await file.read()
         imagen = Image.open(io.BytesIO(contenido_imagen))
         cliente = genai.Client(api_key=api_key)
-        
+
         prompt = """
         Analiza detenidamente esta imagen de comida.
         1. Identifica el plato o los alimentos presentes.
         2. Estima la porción razonable en gramos para cada ingrediente visible.
         3. Calcula los macronutrientes totales (calorías, proteínas, carbohidratos, grasas).
-        
+
         Responde ÚNICAMENTE con un objeto JSON válido sin bloques markdown:
         {
           "nombre_plato": "Nombre corto del plato",
@@ -58,53 +60,78 @@ async def analizar_plato(file: UploadFile = File(...)):
           "macros_totales": {"kcal": 450, "proteinas_g": 35, "carbohidratos_g": 40, "grasas_g": 15}
         }
         """
-        
+
         respuesta = cliente.models.generate_content(
             model='gemini-2.5-flash',
             contents=[imagen, prompt]
         )
-        
+
         texto_limpio = respuesta.text.replace("```json", "").replace("```", "").strip()
         return json.loads(texto_limpio)
     except Exception as e:
         return {"error": "No se pudo analizar la imagen", "detalle": str(e)}
 
-# --- BÚSQUEDA DE PRECIOS CON CACHÉ DE SUPABASE ---
+
+# --- BÚSQUEDA DE PRECIOS: SIN FALLBACKS FIJOS ---
+# Cada función de búsqueda devuelve None si no encuentra el producto o si la
+# petición falla, en lugar de un precio inventado. Así el filtrado posterior
+# puede descartar limpiamente lo que no sea un resultado real.
+
 async def buscar_en_lider(cliente: httpx.AsyncClient, producto: str):
     try:
         url = f"https://apps.lider.cl/bff/search?query={producto}&page=1&facets="
-        res = await cliente.get(url, headers=HEADERS, timeout=4.0)
+        res = await cliente.get(url, headers=HEADERS, timeout=6.0)
         if res.status_code == 200:
             datos = res.json()
-            if datos.get("products"):
-                p = datos["products"][0]
-                return {
-                    "supermercado": "Lider",
-                    "producto": p.get("displayName"),
-                    "precio": p.get("price", {}).get("BasePriceSales")
-                }
-    except Exception:
-        pass
-    return {"supermercado": "Lider", "producto": f"{producto.title()} (Base)", "precio": 2490}
+            productos = datos.get("products") or []
+            if productos:
+                p = productos[0]
+                precio = p.get("price", {}).get("BasePriceSales")
+                nombre = p.get("displayName")
+                if precio is not None and nombre:
+                    return {
+                        "supermercado": "Lider",
+                        "producto": nombre,
+                        "precio": precio,
+                    }
+    except Exception as e:
+        print(f"Error buscando en Lider ({producto}): {e}")
+    return None
+
 
 async def buscar_en_cencosud(cliente: httpx.AsyncClient, producto: str, marca: str):
     try:
         dominio = "jumbo.cl" if marca == "Jumbo" else "santaisabel.cl"
         url = f"https://www.{dominio}/api/catalog_system/pub/products/search/{producto}"
-        res = await cliente.get(url, headers=HEADERS, timeout=4.0)
-        if res.status_code == 200 and len(res.json()) > 0:
-            p = res.json()[0]
-            precio = p["items"][0]["sellers"][0]["commertialOffer"]["Price"]
-            return {"supermercado": marca, "producto": p.get("productName"), "precio": precio}
-    except Exception:
-        pass
-    return {"supermercado": marca, "producto": f"{producto.title()} (Base)", "precio": 2590 if marca == "Jumbo" else 2390}
+        res = await cliente.get(url, headers=HEADERS, timeout=6.0)
+        if res.status_code == 200:
+            datos = res.json()
+            if isinstance(datos, list) and len(datos) > 0:
+                p = datos[0]
+                try:
+                    precio = p["items"][0]["sellers"][0]["commertialOffer"]["Price"]
+                except (KeyError, IndexError, TypeError):
+                    precio = None
+                nombre = p.get("productName")
+                if precio is not None and nombre:
+                    return {
+                        "supermercado": marca,
+                        "producto": nombre,
+                        "precio": precio,
+                    }
+    except Exception as e:
+        print(f"Error buscando en {marca} ({producto}): {e}")
+    return None
+
 
 @app.get("/api/precios")
 async def obtener_precios(producto: str):
     busqueda_limpia = producto.lower().strip()
-    
-    # 1. Intentar leer desde la caché de Supabase
+
+    if not busqueda_limpia:
+        return {"busqueda": busqueda_limpia, "origen": "sin_busqueda", "resultados": []}
+
+    # 1. Intentar leer desde la caché de Supabase (sólo si hay filas reales cacheadas)
     if supabase:
         try:
             cache = supabase.table("precios_cache").select("*").eq("busqueda", busqueda_limpia).execute()
@@ -116,40 +143,45 @@ async def obtener_precios(producto: str):
                         {
                             "supermercado": item["supermercado"],
                             "producto": item["producto_nombre"],
-                            "precio": item["precio"]
-                        } for item in cache.data
-                    ]
+                            "precio": item["precio"],
+                        }
+                        for item in cache.data
+                    ],
                 }
         except Exception as e:
             print(f"Error consultando caché Supabase: {e}")
 
-    # 2. Si no está en caché, buscar en tiempo real
+    # 2. Si no está en caché, buscar en tiempo real en las 3 tiendas en paralelo
     async with httpx.AsyncClient() as cliente:
         tareas = [
             buscar_en_lider(cliente, busqueda_limpia),
             buscar_en_cencosud(cliente, busqueda_limpia, "Jumbo"),
-            buscar_en_cencosud(cliente, busqueda_limpia, "Santa Isabel")
+            buscar_en_cencosud(cliente, busqueda_limpia, "Santa Isabel"),
         ]
-        resultados = await asyncio.gather(*tareas)
-    
-    # 3. Guardar en Supabase para futuras consultas
-    if supabase:
+        resultados_crudos = await asyncio.gather(*tareas)
+
+    # 3. Descartar cualquier búsqueda que haya fallado o no encontrado nada real
+    resultados = [r for r in resultados_crudos if r is not None]
+
+    # 4. Guardar en Supabase sólo si hay resultados reales (nunca precios inventados)
+    if supabase and resultados:
         try:
             para_insertar = [
                 {
                     "busqueda": busqueda_limpia,
-                    "supermercado": r.get("supermercado"),
-                    "producto_nombre": r.get("producto"),
-                    "precio": r.get("precio")
-                } for r in resultados if r.get("precio") is not None
+                    "supermercado": r["supermercado"],
+                    "producto_nombre": r["producto"],
+                    "precio": r["precio"],
+                }
+                for r in resultados
             ]
-            if para_insertar:
-                supabase.table("precios_cache").insert(para_insertar).execute()
+            supabase.table("precios_cache").insert(para_insertar).execute()
         except Exception as e:
             print(f"Error guardando en caché Supabase: {e}")
 
+    # 5. Si no se encontró nada real, se devuelve un arreglo vacío con código 200
     return {
         "busqueda": busqueda_limpia,
-        "origen": "en_vivo",
-        "resultados": resultados
+        "origen": "en_vivo" if resultados else "sin_resultados",
+        "resultados": resultados,
     }

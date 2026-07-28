@@ -24,8 +24,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
-# Headers más "de navegador real" — reduce (no elimina) la chance de bloqueo
-# por firewalls anti-bot como DataDome, que Lider y varios retailers chilenos usan.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -85,6 +83,8 @@ async def analizar_plato(file: UploadFile = File(...)):
 # --- BÚSQUEDA DE PRECIOS ---
 
 async def buscar_en_lider(cliente: httpx.AsyncClient, producto: str):
+    # NOTA: apps.lider.cl/bff/search da 404 -> Walmart Chile cambió esta ruta.
+    # Pendiente reemplazar por la URL real (ver instrucciones abajo).
     try:
         url = f"https://apps.lider.cl/bff/search?query={producto}&page=1&facets="
         res = await cliente.get(url, headers=HEADERS, timeout=8.0)
@@ -107,14 +107,18 @@ async def buscar_en_lider(cliente: httpx.AsyncClient, producto: str):
 
 
 async def buscar_en_cencosud(cliente: httpx.AsyncClient, producto: str, marca: str):
+    # VTEX descontinuó /api/catalog_system/pub/products/search/ (da 410 Gone).
+    # Ahora se usa la Intelligent Search API v1, pública y sin autenticación.
     try:
         dominio = "jumbo.cl" if marca == "Jumbo" else "santaisabel.cl"
-        url = f"https://www.{dominio}/api/catalog_system/pub/products/search/{producto}"
-        res = await cliente.get(url, headers=HEADERS_CENCOSUD, timeout=8.0)
+        url = f"https://www.{dominio}/api/io/_v/api/intelligent-search/product_search"
+        params = {"query": producto, "count": 5}
+        res = await cliente.get(url, headers=HEADERS_CENCOSUD, params=params, timeout=8.0)
         if res.status_code == 200:
             datos = res.json()
-            if isinstance(datos, list) and len(datos) > 0:
-                p = datos[0]
+            productos = datos.get("products") or []
+            if productos:
+                p = productos[0]
                 try:
                     precio = p["items"][0]["sellers"][0]["commertialOffer"]["Price"]
                 except (KeyError, IndexError, TypeError):
@@ -190,20 +194,13 @@ async def obtener_precios(producto: str):
 
 
 # --- ENDPOINT DE DIAGNÓSTICO (TEMPORAL) ---
-# Llama a esto desde el navegador o Postman:
-#   https://TU-BACKEND.onrender.com/api/debug-precios?producto=leche
-# Te muestra el status HTTP real y los primeros 500 caracteres de la
-# respuesta cruda de cada tienda, sin filtrar nada. Con esto vemos si:
-#   - status 403 / 429 -> te están bloqueando por IP (muy probable en Render)
-#   - status 200 pero body vacío o distinto -> cambió la estructura del endpoint
-#   - timeout / excepción -> el dominio no responde desde el servidor de Render
+# https://TU-BACKEND.onrender.com/api/debug-precios?producto=leche
 @app.get("/api/debug-precios")
 async def debug_precios(producto: str):
     busqueda_limpia = producto.lower().strip()
     resultado_diagnostico = {}
 
     async with httpx.AsyncClient() as cliente:
-        # Lider
         try:
             url_lider = f"https://apps.lider.cl/bff/search?query={busqueda_limpia}&page=1&facets="
             res = await cliente.get(url_lider, headers=HEADERS, timeout=10.0)
@@ -215,25 +212,29 @@ async def debug_precios(producto: str):
         except Exception as e:
             resultado_diagnostico["lider"] = {"error": str(e)}
 
-        # Jumbo
         try:
-            url_jumbo = f"https://www.jumbo.cl/api/catalog_system/pub/products/search/{busqueda_limpia}"
-            res = await cliente.get(url_jumbo, headers=HEADERS_CENCOSUD, timeout=10.0)
+            url_jumbo = "https://www.jumbo.cl/api/io/_v/api/intelligent-search/product_search"
+            res = await cliente.get(
+                url_jumbo, headers=HEADERS_CENCOSUD,
+                params={"query": busqueda_limpia, "count": 5}, timeout=10.0,
+            )
             resultado_diagnostico["jumbo"] = {
                 "status_code": res.status_code,
-                "url": url_jumbo,
+                "url": str(res.url),
                 "cuerpo_crudo": res.text[:500],
             }
         except Exception as e:
             resultado_diagnostico["jumbo"] = {"error": str(e)}
 
-        # Santa Isabel
         try:
-            url_si = f"https://www.santaisabel.cl/api/catalog_system/pub/products/search/{busqueda_limpia}"
-            res = await cliente.get(url_si, headers=HEADERS_CENCOSUD, timeout=10.0)
+            url_si = "https://www.santaisabel.cl/api/io/_v/api/intelligent-search/product_search"
+            res = await cliente.get(
+                url_si, headers=HEADERS_CENCOSUD,
+                params={"query": busqueda_limpia, "count": 5}, timeout=10.0,
+            )
             resultado_diagnostico["santa_isabel"] = {
                 "status_code": res.status_code,
-                "url": url_si,
+                "url": str(res.url),
                 "cuerpo_crudo": res.text[:500],
             }
         except Exception as e:
